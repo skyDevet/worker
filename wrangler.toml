@@ -1,0 +1,11 @@
+name = "worker"
+main = "index.js"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+NODE_ENV = "production"
+FAYDA_AUTH_URL     = "https://esignet.ida.fayda.et/v1/esignet/oauth/v2/authorize"
+FAYDA_TOKEN_URL    = "https://esignet.ida.fayda.et/v1/esignet/oauth/v2/token"
+FAYDA_USERINFO_URL = "https://esignet.ida.fayda.et/v1/esignet/oidc/userinfo"
+FAYDA_SCOPE        = "openid profile email phone"
