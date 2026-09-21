@@ -4,6 +4,7 @@
 // ============================================================
 const API_BASE = 'https://worker.skyn4302.workers.dev/api/nlp';
 
+//const API_BASE = 'htto://127.0.0.1:4000/api/nlp';
 import { vinDecoder } from './vinDecoder.js';
 import { getServiceConfigDB } from './serviceConfigDB.js';
 import { executeStepApiActions, executeFieldApiActions } from './apiTasks.js';
@@ -43,7 +44,7 @@ function getLocalizedOptions(optionsObj) {
 }
 
 // ============================================================
-// DEFAULT SERVICES (seed / fallback)
+// DEFAULT SERVICES  (fallback / seed source)
 // ============================================================
 const DEFAULT_SERVICES = {
   iftms: {
@@ -193,11 +194,8 @@ let services = {};
 let servicesInitialized = false;
 let db = null;
 
-// Per-session service states: Map<sessionId, { [serviceId]: state }>
+// Per-session service states: Map<sessionId, Map<serviceId, state>>
 const sessionStates = new Map();
-
-// Per-session "awaiting answer" flags: Map<sessionId, { serviceId, since }>
-const sessionAwaitingAnswer = new Map();
 
 function getSessionStates(sessionId) {
   if (!sessionStates.has(sessionId)) {
@@ -217,19 +215,6 @@ function getActiveStates() {
   return getSessionStates(activeSessionId);
 }
 
-// --- awaiting-answer helpers -------------------------------------------
-function markAwaitingAnswer(sessionId, serviceId) {
-  sessionAwaitingAnswer.set(sessionId, { serviceId, since: Date.now() });
-}
-
-function clearAwaitingAnswer(sessionId) {
-  sessionAwaitingAnswer.delete(sessionId);
-}
-
-function isAwaitingAnswer(sessionId) {
-  return sessionAwaitingAnswer.has(sessionId);
-}
-
 // ============================================================
 // SERVICE INIT (Supabase as source of truth; DEFAULT_SERVICES as seed/fallback)
 // ============================================================
@@ -239,6 +224,7 @@ async function initializeServices() {
     console.log('📂 Initializing services from Supabase...');
     db = await getServiceConfigDB();
 
+    // Seed the table if empty (idempotent)
     try {
       const seed = await db.seedDefaultServices?.('if-empty');
       if (seed?.inserted > 0) {
@@ -250,6 +236,7 @@ async function initializeServices() {
       console.warn('⚠️ Seed step skipped:', seedErr.message);
     }
 
+    // Load configs from Supabase
     const dbConfigs = await db.getAllServiceConfigs();
     services = {};
 
@@ -270,6 +257,7 @@ async function initializeServices() {
       }
     }
 
+    // Fallback if Supabase returned nothing usable
     if (Object.keys(services).length === 0) {
       console.warn('⚠️ Supabase returned no configs — falling back to DEFAULT_SERVICES');
       services = { ...DEFAULT_SERVICES };
@@ -992,16 +980,12 @@ export async function processMessage(message, file) {
     }
 
     // ----- 3. detectIntent() for help / status / reset -----
-    try {
-      const intentResult = detectIntent(message);
-      if (intentResult) {
-        console.log(`🎯 intent: ${intentResult.intent} (score ${intentResult.score})`);
-        if (intentResult.intent === 'help')   return await executeAction('help', null, message);
-        if (intentResult.intent === 'status') return await executeAction('status', null, message);
-        if (intentResult.intent === 'reset')  return await executeAction('reset', null, message);
-      }
-    } catch (intentErr) {
-      console.warn('detectIntent failed:', intentErr.message);
+    const intentResult = detectIntent(message);
+    if (intentResult) {
+      console.log(`🎯 intent: ${intentResult.intent} (score ${intentResult.score})`);
+      if (intentResult.intent === 'help')   return await executeAction('help', null, message);
+      if (intentResult.intent === 'status') return await executeAction('status', null, message);
+      if (intentResult.intent === 'reset')  return await executeAction('reset', null, message);
     }
 
     // ----- 4. Service switch -----
@@ -1074,23 +1058,21 @@ export async function processMessage(message, file) {
 /**
  * chat(msg, file, sessionId, mode, serviceId)
  *
- *   mode = "stage"  → present current step, NO validation, mark session as awaiting input
+ *   mode = "stage"  → present current step, NO validation
  *   mode = "answer" → validate + advance
- *   mode = "chat"   → free-form; auto-promoted to "answer" if a service is mid-flow
+ *   mode = "chat"   → free-form (auto-promoted to "answer" if a service is mid-flow)
  */
 export async function chat(msg, file, sessionId, mode = 'chat', serviceId = null) {
   try {
-    const sid = sessionId || activeSessionId;
     if (sessionId) setActiveSession(sessionId);
     await initializeServices();
 
-    // ----- STAGE: present step, mark awaiting answer -----
+    // ----- STAGE -----
     if (mode === 'stage') {
       if (serviceId && services[serviceId]) {
         currentService = serviceId;
         const states = getActiveStates();
-        // Fresh start only if no existing state (preserve progress on re-stage)
-        if (!states[serviceId] || states[serviceId].isComplete) {
+        if (!states[serviceId]) {
           states[serviceId] = {
             currentStep: services[serviceId].initStep || 1,
             currentFieldIndex: 0,
@@ -1101,34 +1083,25 @@ export async function chat(msg, file, sessionId, mode = 'chat', serviceId = null
             isComplete: false
           };
         }
-      } else {
-        // Ensure state exists for the current service
-        getState();
       }
-      markAwaitingAnswer(sid, currentService);
+      // stepIntro() presents the current step WITHOUT validating.
       return await stepIntro();
     }
 
-    // ----- Detect mid-flow -----
-    const states = getActiveStates();
-    getState(); // materialize current service state
-    const svcState = states[currentService];
-    const midFlow =
-      svcState &&
-      !svcState.isComplete &&
-      (isAwaitingAnswer(sid) ||
-        svcState.waitingForAdd ||
-        svcState.waitingForContinue ||
-        svcState.currentFieldIndex > 0);
-
-    // Auto-promote chat → answer when mid-flow
-    if (mode === 'chat' && !file && midFlow) {
-      mode = 'answer';
+    // ----- Auto-promote chat → answer when a service is mid-flow -----
+    if (mode === 'chat' && !file) {
+      const states = getActiveStates();
+      const svcState = states[currentService];
+      if (svcState && !svcState.isComplete) {
+        const step = getStep();
+        const fields = step?.subprocess?.fields || step?.fields || [];
+        if (fields.length > 0 && svcState.currentFieldIndex < fields.length) {
+          mode = 'answer';
+        }
+      }
     }
 
-    // Any real input clears the awaiting flag (will be re-set by next stage)
-    if (msg || file) clearAwaitingAnswer(sid);
-
+    // ----- ANSWER / CHAT -----
     return await processMessage(msg, file);
   } catch (error) {
     console.error('❌ Chat error:', error);
@@ -1140,94 +1113,6 @@ export async function chat(msg, file, sessionId, mode = 'chat', serviceId = null
       isStructured: true
     };
   }
-}
-
-/**
- * resume(sessionId)
- * Re-stages the current prompt without resetting state. Use on page reload / navigation back.
- */
-export async function resume(sessionId) {
-  try {
-    const sid = sessionId || activeSessionId;
-    if (sessionId) setActiveSession(sessionId);
-    await initializeServices();
-
-    const states = getActiveStates();
-    getState(); // materialize
-
-    const svcState = states[currentService];
-    const step = getStep();
-
-    markAwaitingAnswer(sid, currentService);
-
-    // Re-emit yes/no prompts if that's what we're waiting on
-    if (svcState?.waitingForAdd && step?.subprocess?.addPrompt) {
-      const prompt = getLocalized(step.subprocess.addPrompt);
-      return { text: prompt, html: `<div>${prompt}</div>`, isStructured: true };
-    }
-    if (svcState?.waitingForContinue && step?.subprocess?.continuePrompt) {
-      const prompt = getLocalized(step.subprocess.continuePrompt);
-      return { text: prompt, html: `<div>${prompt}</div>`, isStructured: true };
-    }
-
-    return await stepIntro();
-  } catch (error) {
-    console.error('❌ Resume error:', error);
-    const errorLabel = getLocalized({ en: 'Error:', am: 'ስህተት:' });
-    return {
-      text: `${errorLabel} ${error.message}`,
-      html: `<div class="error">❌ ${errorLabel} ${error.message}</div>`,
-      isStructured: true
-    };
-  }
-}
-
-/**
- * getSessionStatus(sessionId)
- * Lets the client decide whether to show "Resume" or "New chat".
- */
-export async function getSessionStatus(sessionId) {
-  const sid = sessionId || activeSessionId;
-  if (sessionId) setActiveSession(sessionId);
-  await initializeServices();
-
-  const states = getActiveStates();
-  getState();
-
-  const svcState = states[currentService];
-  const svc = services[currentService];
-
-  return {
-    sessionId: sid,
-    serviceId: currentService,
-    serviceName: svc ? getLocalized(svc.name) : null,
-    currentStep: svcState?.currentStep ?? null,
-    currentFieldIndex: svcState?.currentFieldIndex ?? 0,
-    waitingForAdd: !!svcState?.waitingForAdd,
-    waitingForContinue: !!svcState?.waitingForContinue,
-    isComplete: !!svcState?.isComplete,
-    awaitingAnswer: isAwaitingAnswer(sid),
-    hasProgress: !!svcState && (
-      svcState.currentStep > (svc?.initStep || 1) ||
-      svcState.currentFieldIndex > 0 ||
-      svcState.waitingForAdd ||
-      svcState.waitingForContinue ||
-      (svcState.collectedData && Object.values(svcState.collectedData).some(v =>
-        Array.isArray(v) ? v.length > 0 : (v && typeof v === 'object' ? Object.keys(v).length > 0 : !!v)
-      ))
-    )
-  };
-}
-
-/**
- * endSession(sessionId)
- * Clean up in-memory state. Call when the user explicitly closes/ends a chat.
- */
-export async function endSession(sessionId) {
-  const sid = sessionId || activeSessionId;
-  sessionStates.delete(sid);
-  sessionAwaitingAnswer.delete(sid);
-  return { ok: true, sessionId: sid };
 }
 
 export async function init() {
@@ -1258,12 +1143,9 @@ export {
 
 export const nlpProcessor = {
   chat,
-  resume,
   processMessage,
   init,
   getAvailableServices,
-  getSessionStatus,
-  endSession,
   resetService,
   isServiceComplete,
   markServiceComplete,
