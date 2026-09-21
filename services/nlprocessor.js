@@ -1,8 +1,6 @@
 // ============================================================
-// nlprocessor.js - Server-side (Node.js)
-// Your full NLP core logic
+// nlprocessor.js - Server-side (Cloudflare Worker)
 // ============================================================
-const API_BASE = 'https://worker.skyn4302.workers.dev/api/nlp';
 
 import { vinDecoder } from './vinDecoder.js';
 import { getServiceConfigDB } from './serviceConfigDB.js';
@@ -10,17 +8,12 @@ import { executeStepApiActions, executeFieldApiActions } from './apiTasks.js';
 import { detectIntent } from './intent.js';
 
 // ============================================================
-// LANGUAGE (server-side, no localStorage)
+// LANGUAGE
 // ============================================================
 let currentLanguage = 'en';
 
-function getLanguage() {
-  return currentLanguage;
-}
-
-function setLanguage(lang) {
-  currentLanguage = lang === 'am' ? 'am' : 'en';
-}
+function getLanguage() { return currentLanguage; }
+function setLanguage(lang) { currentLanguage = lang === 'am' ? 'am' : 'en'; }
 
 function getLocalized(obj) {
   if (!obj) return '';
@@ -186,52 +179,33 @@ const DEFAULT_SERVICES = {
 };
 
 // ============================================================
-// STATE (server-side, in-memory; per-session keyed by sessionId)
+// STATE (per-session, in-memory)
 // ============================================================
 let currentService = 'iftms';
 let services = {};
 let servicesInitialized = false;
 let db = null;
 
-// Per-session service states: Map<sessionId, { [serviceId]: state }>
-const sessionStates = new Map();
-
-// Per-session "awaiting answer" flags: Map<sessionId, { serviceId, since }>
-const sessionAwaitingAnswer = new Map();
+const sessionStates = new Map();           // Map<sessionId, { [serviceId]: state }>
+const sessionAwaitingAnswer = new Map();   // Map<sessionId, { serviceId, since }>
 
 function getSessionStates(sessionId) {
-  if (!sessionStates.has(sessionId)) {
-    sessionStates.set(sessionId, {});
-  }
+  if (!sessionStates.has(sessionId)) sessionStates.set(sessionId, {});
   return sessionStates.get(sessionId);
 }
 
-// For backward-compat with the original single-session logic, we keep a default session
 let activeSessionId = 'default';
+function setActiveSession(sessionId) { if (sessionId) activeSessionId = sessionId; }
+function getActiveStates() { return getSessionStates(activeSessionId); }
 
-function setActiveSession(sessionId) {
-  if (sessionId) activeSessionId = sessionId;
-}
-
-function getActiveStates() {
-  return getSessionStates(activeSessionId);
-}
-
-// --- awaiting-answer helpers -------------------------------------------
 function markAwaitingAnswer(sessionId, serviceId) {
   sessionAwaitingAnswer.set(sessionId, { serviceId, since: Date.now() });
 }
-
-function clearAwaitingAnswer(sessionId) {
-  sessionAwaitingAnswer.delete(sessionId);
-}
-
-function isAwaitingAnswer(sessionId) {
-  return sessionAwaitingAnswer.has(sessionId);
-}
+function clearAwaitingAnswer(sessionId) { sessionAwaitingAnswer.delete(sessionId); }
+function isAwaitingAnswer(sessionId) { return sessionAwaitingAnswer.has(sessionId); }
 
 // ============================================================
-// SERVICE INIT (Supabase as source of truth; DEFAULT_SERVICES as seed/fallback)
+// SERVICE INIT
 // ============================================================
 async function initializeServices() {
   if (servicesInitialized) return true;
@@ -241,13 +215,10 @@ async function initializeServices() {
 
     try {
       const seed = await db.seedDefaultServices?.('if-empty');
-      if (seed?.inserted > 0) {
-        console.log(`🌱 Seeded ${seed.inserted} default service(s) into Supabase`);
-      } else if (seed?.skipped) {
-        console.log(`🌱 Supabase already has ${seed.skipped} service(s), skipping seed`);
-      }
+      if (seed?.inserted > 0) console.log(`🌱 Seeded ${seed.inserted} service(s)`);
+      else if (seed?.skipped) console.log(`🌱 Supabase already has ${seed.skipped} service(s)`);
     } catch (seedErr) {
-      console.warn('⚠️ Seed step skipped:', seedErr.message);
+      console.warn('⚠️ Seed skipped:', seedErr.message);
     }
 
     const dbConfigs = await db.getAllServiceConfigs();
@@ -264,14 +235,12 @@ async function initializeServices() {
           collectedData: dbConfig.collectedData || {},
           steps: dbConfig.steps || {}
         };
-        if (service && service.id && Object.keys(service.steps).length > 0) {
-          services[service.id] = service;
-        }
+        if (service.id && Object.keys(service.steps).length > 0) services[service.id] = service;
       }
     }
 
     if (Object.keys(services).length === 0) {
-      console.warn('⚠️ Supabase returned no configs — falling back to DEFAULT_SERVICES');
+      console.warn('⚠️ Falling back to DEFAULT_SERVICES');
       services = { ...DEFAULT_SERVICES };
     }
 
@@ -281,10 +250,10 @@ async function initializeServices() {
     }
 
     servicesInitialized = true;
-    console.log(`📚 Services initialized: ${Object.keys(services).length} available`);
+    console.log(`📚 Services initialized: ${Object.keys(services).length}`);
     return true;
   } catch (error) {
-    console.error('❌ Error initializing services from Supabase:', error.message);
+    console.error('❌ Init error:', error.message);
     services = { ...DEFAULT_SERVICES };
     servicesInitialized = true;
     return true;
@@ -299,19 +268,15 @@ export async function reloadServices() {
 export async function watchServiceConfigs(onChange) {
   await initializeServices();
   if (!db || typeof db.subscribe !== 'function') {
-    console.warn('⚠️ Realtime subscribe not available');
+    console.warn('⚠️ Realtime not available');
     return () => {};
   }
-  const unsub = db.subscribe(async (payload) => {
-    console.log('🔄 service_configs changed:', payload?.eventType);
+  return db.subscribe(async (payload) => {
     try {
       await reloadServices();
       if (typeof onChange === 'function') onChange(payload);
-    } catch (e) {
-      console.error('❌ Reload after realtime change failed:', e.message);
-    }
+    } catch (e) { console.error('Reload failed:', e.message); }
   });
-  return unsub;
 }
 
 // ============================================================
@@ -366,9 +331,7 @@ function getCurrentField() {
 
 function isServiceComplete(serviceId) {
   const states = getActiveStates();
-  const state = states[serviceId];
-  if (!state) return false;
-  return state.isComplete === true;
+  return states[serviceId]?.isComplete === true;
 }
 
 function markServiceComplete(serviceId) {
@@ -377,9 +340,7 @@ function markServiceComplete(serviceId) {
     const svc = services[serviceId];
     states[serviceId] = {
       currentStep: svc?.initStep || 1,
-      currentFieldIndex: 0,
-      waitingForAdd: false,
-      waitingForContinue: false,
+      currentFieldIndex: 0, waitingForAdd: false, waitingForContinue: false,
       currentItem: {},
       collectedData: JSON.parse(JSON.stringify(svc?.collectedData || {})),
       isComplete: true
@@ -395,9 +356,7 @@ function resetService(serviceId) {
   const states = getActiveStates();
   states[serviceId] = {
     currentStep: svc.initStep || 1,
-    currentFieldIndex: 0,
-    waitingForAdd: false,
-    waitingForContinue: false,
+    currentFieldIndex: 0, waitingForAdd: false, waitingForContinue: false,
     currentItem: {},
     collectedData: JSON.parse(JSON.stringify(svc.collectedData || {})),
     isComplete: false
@@ -451,11 +410,8 @@ function validateField(input, field) {
 
   if (field.regex) {
     const re = new RegExp(field.regex, 'i');
-    if (!re.test(value)) {
-      return { valid: false, message: errorMsg || `Invalid. Example: ${exampleMsg}` };
-    }
+    if (!re.test(value)) return { valid: false, message: errorMsg || `Invalid. Example: ${exampleMsg}` };
   }
-
   return { valid: true, value };
 }
 
@@ -472,7 +428,7 @@ function saveToState(fieldName, value) {
 }
 
 // ============================================================
-// VIN PROCESSING
+// VIN
 // ============================================================
 function processVIN(input) {
   try {
@@ -488,7 +444,7 @@ function processVIN(input) {
     if (typeof vinDecoder.getCompleteVehicleData !== 'function') return null;
     return vinDecoder.getCompleteVehicleData(vin);
   } catch (error) {
-    console.error('VIN processing error:', error);
+    console.error('VIN error:', error);
     return null;
   }
 }
@@ -557,24 +513,16 @@ async function stepIntro() {
 async function buildComplete() {
   const state = getState();
   const svc = getService();
-  const lang = getLanguage();
-  const isAmharic = lang === 'am';
+  const isAmharic = getLanguage() === 'am';
 
   if (!isServiceComplete(currentService)) {
     const step = getStep();
-    if (step) {
-      const title = getLocalized(step.title);
-      const prompt = getLocalized(step.prompt);
-      const notCompleteMsg = getLocalized({ en: 'This service is not yet complete. Please continue with the registration.', am: 'ይህ አገልግሎት እስካሁን አልተጠናቀቀም። እባክዎ ምዝገባውን ይቀጥሉ።' });
-      return {
-        text: `${notCompleteMsg}\n\n${title}: ${prompt || ''}`,
-        html: `<div>${notCompleteMsg}<br><br><strong>${title}</strong><br>${prompt || ''}</div>`,
-        isStructured: true
-      };
-    }
+    const title = step ? getLocalized(step.title) : '';
+    const prompt = step ? getLocalized(step.prompt) : '';
+    const notCompleteMsg = getLocalized({ en: 'This service is not yet complete. Please continue.', am: 'ይህ አገልግሎት እስካሁን አልተጠናቀቀም። እባክዎ ይቀጥሉ።' });
     return {
-      text: getLocalized({ en: 'Service not complete. Please continue.', am: 'አገልግሎት አልተጠናቀቀም። እባክዎ ይቀጥሉ።' }),
-      html: `<div>${getLocalized({ en: 'Service not complete. Please continue.', am: 'አገልግሎት አልተጠናቀቀም። እባክዎ ይቀጥሉ።' })}</div>`,
+      text: `${notCompleteMsg}\n\n${title}: ${prompt || ''}`,
+      html: `<div>${notCompleteMsg}<br><br><strong>${title}</strong><br>${prompt || ''}</div>`,
       isStructured: true
     };
   }
@@ -633,10 +581,7 @@ async function executeAction(action, rawValue, originalMessage) {
           return { text: `${received} ${originalMessage}`, html: `<div>${received} ${originalMessage}</div>`, isStructured: true };
         }
 
-        // VIN auto-fill branch
         if (currentField.name === 'vinNumber' || currentField.name === 'chassisNumber') {
-          console.log('🔍 Processing VIN field with input:', originalMessage);
-
           if (currentField.apiActions && currentField.apiActions.length > 0) {
             const context = {
               userInput: originalMessage,
@@ -648,8 +593,7 @@ async function executeAction(action, rawValue, originalMessage) {
             const apiResult = await executeFieldApiActions(currentField, context);
             if (apiResult.success && apiResult.message) {
               if (apiResult.result?.data) {
-                const autoFillData = apiResult.result.data;
-                for (const [key, value] of Object.entries(autoFillData)) {
+                for (const [key, value] of Object.entries(apiResult.result.data)) {
                   if (value && value !== 'Unknown') saveToState(key, value);
                 }
               }
@@ -674,7 +618,7 @@ async function executeAction(action, rawValue, originalMessage) {
             for (const field of fields) {
               if (isAutoFillField(field)) {
                 const fieldValue = vinResult[field.name];
-                if (fieldValue && fieldValue !== 'Unknown' && fieldValue !== '' && fieldValue !== null && fieldValue !== undefined) {
+                if (fieldValue && fieldValue !== 'Unknown' && fieldValue !== '' && fieldValue != null) {
                   saveToState(field.name, fieldValue);
                   state.currentFieldIndex++;
                   autoFilledCount++;
@@ -845,9 +789,7 @@ async function executeAction(action, rawValue, originalMessage) {
           if (!states[target]) {
             states[target] = {
               currentStep: services[target].initStep || 1,
-              currentFieldIndex: 0,
-              waitingForAdd: false,
-              waitingForContinue: false,
+              currentFieldIndex: 0, waitingForAdd: false, waitingForContinue: false,
               currentItem: {},
               collectedData: JSON.parse(JSON.stringify(services[target].collectedData || {})),
               isComplete: false
@@ -882,8 +824,7 @@ async function executeAction(action, rawValue, originalMessage) {
           .filter(([, v]) => v && (Array.isArray(v) ? v.length > 0 : Object.keys(v).length > 0))
           .map(([k, v]) => {
             const label = getLanguage() === 'am' ?
-              { operator: 'ኦፕሬተር', vehicles: 'ተሽከርካሪዎች', drivers: 'አሽከርካሪዎች' }[k] || k :
-              k;
+              { operator: 'ኦፕሬተር', vehicles: 'ተሽከርካሪዎች', drivers: 'አሽከርካሪዎች' }[k] || k : k;
             return `${label}: ${Array.isArray(v) ? v.length + ' item(s)' : '✓'}`;
           })
           .join(', ') || getLocalized({ en: 'nothing yet', am: 'እስካሁን ምንም' });
@@ -933,7 +874,7 @@ async function executeAction(action, rawValue, originalMessage) {
     const defaultPrompt = getLocalized(getStep()?.prompt) || getLocalized({ en: 'How can I help?', am: 'እንዴት ልረዳ?' });
     return { text: defaultPrompt, html: `<div>${defaultPrompt}</div>`, isStructured: true };
   } catch (error) {
-    console.error('❌ Error in executeAction:', error);
+    console.error('❌ executeAction error:', error);
     const errorLabel = getLocalized({ en: 'Error:', am: 'ስህተት:' });
     const unknownError = getLocalized({ en: 'Unknown error', am: 'ያልታወቀ ስህተት' });
     return {
@@ -950,7 +891,6 @@ async function executeAction(action, rawValue, originalMessage) {
 export async function processMessage(message, file) {
   try {
     console.log('📨 Processing:', message || '[file]');
-
     await initializeServices();
 
     if (file) {
@@ -976,13 +916,11 @@ export async function processMessage(message, file) {
 
     const state = getState();
 
-    // ----- 1. Yes/No has priority when waiting -----
     if (state.waitingForAdd || state.waitingForContinue) {
       const yesno = checkYesNo(message);
       if (yesno) return await executeAction(yesno, null, message);
     }
 
-    // ----- 2. VIN short-circuit on VIN/chassis fields -----
     const vinPattern = /^[A-HJ-NPR-Z0-9]{10,18}$/i;
     if (vinPattern.test(message.trim())) {
       const currentField = getCurrentField();
@@ -991,11 +929,9 @@ export async function processMessage(message, file) {
       }
     }
 
-    // ----- 3. detectIntent() for help / status / reset -----
     try {
       const intentResult = detectIntent(message);
       if (intentResult) {
-        console.log(`🎯 intent: ${intentResult.intent} (score ${intentResult.score})`);
         if (intentResult.intent === 'help')   return await executeAction('help', null, message);
         if (intentResult.intent === 'status') return await executeAction('status', null, message);
         if (intentResult.intent === 'reset')  return await executeAction('reset', null, message);
@@ -1004,7 +940,6 @@ export async function processMessage(message, file) {
       console.warn('detectIntent failed:', intentErr.message);
     }
 
-    // ----- 4. Service switch -----
     const switchTarget = checkServiceSwitch(message);
     if (switchTarget && switchTarget !== currentService && services[switchTarget]) {
       currentService = switchTarget;
@@ -1012,9 +947,7 @@ export async function processMessage(message, file) {
       if (!states[switchTarget]) {
         states[switchTarget] = {
           currentStep: services[switchTarget].initStep || 1,
-          currentFieldIndex: 0,
-          waitingForAdd: false,
-          waitingForContinue: false,
+          currentFieldIndex: 0, waitingForAdd: false, waitingForContinue: false,
           currentItem: {},
           collectedData: JSON.parse(JSON.stringify(services[switchTarget].collectedData || {})),
           isComplete: false
@@ -1032,7 +965,6 @@ export async function processMessage(message, file) {
       };
     }
 
-    // ----- 5. Save on current field -----
     const currentField = getCurrentField();
     if (currentField) {
       const validation = validateField(message, currentField);
@@ -1046,7 +978,6 @@ export async function processMessage(message, file) {
       };
     }
 
-    // ----- 6. Free-form fallback -----
     const received = getLocalized({ en: 'I received:', am: 'ተቀብያለሁ:' });
     const serviceList = Object.values(services).map(s => `• ${getLocalized(s.name)}`).join('\n');
     const availableServices = getLocalized({ en: 'Available services:', am: 'የሚገኙ አገልግሎቶች:' });
@@ -1056,7 +987,7 @@ export async function processMessage(message, file) {
       isStructured: true
     };
   } catch (error) {
-    console.error('❌ Error:', error);
+    console.error('❌ processMessage error:', error);
     const errorLabel = getLocalized({ en: 'Error:', am: 'ስህተት:' });
     const unknownError = getLocalized({ en: 'Unknown error', am: 'ያልታወቀ ስህተት' });
     return {
@@ -1074,9 +1005,9 @@ export async function processMessage(message, file) {
 /**
  * chat(msg, file, sessionId, mode, serviceId)
  *
- *   mode = "stage"  → present current step, NO validation, mark session as awaiting input
+ *   mode = "stage"  → present current step, NO validation, mark awaiting answer
  *   mode = "answer" → validate + advance
- *   mode = "chat"   → free-form; auto-promoted to "answer" if a service is mid-flow
+ *   mode = "chat"   → free-form (auto-promoted to "answer" if mid-flow)
  */
 export async function chat(msg, file, sessionId, mode = 'chat', serviceId = null) {
   try {
@@ -1084,12 +1015,11 @@ export async function chat(msg, file, sessionId, mode = 'chat', serviceId = null
     if (sessionId) setActiveSession(sessionId);
     await initializeServices();
 
-    // ----- STAGE: present step, mark awaiting answer -----
+    // ----- STAGE -----
     if (mode === 'stage') {
       if (serviceId && services[serviceId]) {
         currentService = serviceId;
         const states = getActiveStates();
-        // Fresh start only if no existing state (preserve progress on re-stage)
         if (!states[serviceId] || states[serviceId].isComplete) {
           states[serviceId] = {
             currentStep: services[serviceId].initStep || 1,
@@ -1102,16 +1032,15 @@ export async function chat(msg, file, sessionId, mode = 'chat', serviceId = null
           };
         }
       } else {
-        // Ensure state exists for the current service
         getState();
       }
       markAwaitingAnswer(sid, currentService);
       return await stepIntro();
     }
 
-    // ----- Detect mid-flow -----
+    // ----- Auto-promote chat → answer when mid-flow -----
     const states = getActiveStates();
-    getState(); // materialize current service state
+    getState(); // ← critical: materialize state before reading
     const svcState = states[currentService];
     const midFlow =
       svcState &&
@@ -1121,17 +1050,15 @@ export async function chat(msg, file, sessionId, mode = 'chat', serviceId = null
         svcState.waitingForContinue ||
         svcState.currentFieldIndex > 0);
 
-    // Auto-promote chat → answer when mid-flow
     if (mode === 'chat' && !file && midFlow) {
       mode = 'answer';
     }
 
-    // Any real input clears the awaiting flag (will be re-set by next stage)
     if (msg || file) clearAwaitingAnswer(sid);
 
     return await processMessage(msg, file);
   } catch (error) {
-    console.error('❌ Chat error:', error);
+    console.error('❌ chat error:', error);
     const errorLabel = getLocalized({ en: 'Error:', am: 'ስህተት:' });
     const unknownError = getLocalized({ en: 'Unknown error', am: 'ያልታወቀ ስህተት' });
     return {
@@ -1143,8 +1070,7 @@ export async function chat(msg, file, sessionId, mode = 'chat', serviceId = null
 }
 
 /**
- * resume(sessionId)
- * Re-stages the current prompt without resetting state. Use on page reload / navigation back.
+ * resume(sessionId) — re-stage current prompt after navigation/reload.
  */
 export async function resume(sessionId) {
   try {
@@ -1153,26 +1079,24 @@ export async function resume(sessionId) {
     await initializeServices();
 
     const states = getActiveStates();
-    getState(); // materialize
+    getState();
 
     const svcState = states[currentService];
     const step = getStep();
 
     markAwaitingAnswer(sid, currentService);
 
-    // Re-emit yes/no prompts if that's what we're waiting on
     if (svcState?.waitingForAdd && step?.subprocess?.addPrompt) {
-      const prompt = getLocalized(step.subprocess.addPrompt);
-      return { text: prompt, html: `<div>${prompt}</div>`, isStructured: true };
+      const p = getLocalized(step.subprocess.addPrompt);
+      return { text: p, html: `<div>${p}</div>`, isStructured: true };
     }
     if (svcState?.waitingForContinue && step?.subprocess?.continuePrompt) {
-      const prompt = getLocalized(step.subprocess.continuePrompt);
-      return { text: prompt, html: `<div>${prompt}</div>`, isStructured: true };
+      const p = getLocalized(step.subprocess.continuePrompt);
+      return { text: p, html: `<div>${p}</div>`, isStructured: true };
     }
-
     return await stepIntro();
   } catch (error) {
-    console.error('❌ Resume error:', error);
+    console.error('❌ resume error:', error);
     const errorLabel = getLocalized({ en: 'Error:', am: 'ስህተት:' });
     return {
       text: `${errorLabel} ${error.message}`,
@@ -1183,8 +1107,7 @@ export async function resume(sessionId) {
 }
 
 /**
- * getSessionStatus(sessionId)
- * Lets the client decide whether to show "Resume" or "New chat".
+ * getSessionStatus(sessionId) — lets the client decide fresh vs. resume.
  */
 export async function getSessionStatus(sessionId) {
   const sid = sessionId || activeSessionId;
@@ -1211,18 +1134,11 @@ export async function getSessionStatus(sessionId) {
       svcState.currentStep > (svc?.initStep || 1) ||
       svcState.currentFieldIndex > 0 ||
       svcState.waitingForAdd ||
-      svcState.waitingForContinue ||
-      (svcState.collectedData && Object.values(svcState.collectedData).some(v =>
-        Array.isArray(v) ? v.length > 0 : (v && typeof v === 'object' ? Object.keys(v).length > 0 : !!v)
-      ))
+      svcState.waitingForContinue
     )
   };
 }
 
-/**
- * endSession(sessionId)
- * Clean up in-memory state. Call when the user explicitly closes/ends a chat.
- */
 export async function endSession(sessionId) {
   const sid = sessionId || activeSessionId;
   sessionStates.delete(sid);
@@ -1234,8 +1150,7 @@ export async function init() {
   try {
     await initializeServices();
     const serviceList = Object.keys(services);
-    console.log(`✅ NLP Processor initialized with ${serviceList.length} services`);
-    console.log('📚 Services:', serviceList);
+    console.log(`✅ NLP Processor initialized: ${serviceList.length} services`);
     return true;
   } catch (error) {
     console.error('❌ Init error:', error);
